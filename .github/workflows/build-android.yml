@@ -1,0 +1,235 @@
+name: Construir APK Android v0.7.1
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main", "master"]
+
+permissions:
+  contents: read
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Descargar repositorio
+        uses: actions/checkout@v6
+
+      - name: Configurar Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Descargar Flutter 3.44.3
+        shell: bash
+        run: |
+          git clone --depth 1 --branch 3.44.3 https://github.com/flutter/flutter.git "$HOME/flutter"
+          echo "$HOME/flutter/bin" >> "$GITHUB_PATH"
+
+      - name: Preparar Flutter para Android
+        run: |
+          flutter config --no-analytics
+          flutter precache --android
+          flutter --version
+
+      - name: Conservar firma de pruebas entre versiones
+        uses: actions/cache@v5
+        with:
+          path: ~/.android/debug.keystore
+          key: avo-tv-debug-keystore-v1
+
+      - name: Crear estructura Android limpia
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/avo_source
+          mkdir -p /tmp/avo_source
+          cp -R lib /tmp/avo_source/lib
+          cp -R assets /tmp/avo_source/assets
+          cp -R tool /tmp/avo_source/tool
+          cp pubspec.yaml /tmp/avo_source/pubspec.yaml
+          cp analysis_options.yaml /tmp/avo_source/analysis_options.yaml
+
+          flutter create \
+            --platforms=android \
+            --org mx.avotv \
+            --project-name avo_tv \
+            --overwrite .
+
+          rm -rf lib assets tool
+          cp -R /tmp/avo_source/lib ./lib
+          cp -R /tmp/avo_source/assets ./assets
+          cp -R /tmp/avo_source/tool ./tool
+          cp /tmp/avo_source/pubspec.yaml ./pubspec.yaml
+          cp /tmp/avo_source/analysis_options.yaml ./analysis_options.yaml
+          rm -f test/widget_test.dart
+
+      - name: Corregir compatibilidad Android Gradle
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          changed = []
+
+          # Plantilla moderna de Flutter: versión AGP en settings.gradle.kts.
+          for file_name in ("android/settings.gradle.kts", "android/settings.gradle"):
+              path = Path(file_name)
+              if not path.exists():
+                  continue
+              text = path.read_text(encoding="utf-8")
+              original = text
+
+              text = re.sub(
+                  r'(id\("com\.android\.application"\)\s+version\s+")[^"]+("\s*(?:apply\s+false)?)',
+                  r'\g<1>8.11.1\g<2>',
+                  text,
+              )
+              text = re.sub(
+                  r'(id\s+["\']com\.android\.application["\']\s+version\s+["\'])[^"\']+(["\']\s*(?:apply\s+false)?)',
+                  r'\g<1>8.11.1\g<2>',
+                  text,
+              )
+
+              if text != original:
+                  path.write_text(text, encoding="utf-8")
+                  changed.append(file_name)
+
+          # Compatibilidad con proyectos que declaran AGP mediante classpath.
+          for file_name in ("android/build.gradle.kts", "android/build.gradle"):
+              path = Path(file_name)
+              if not path.exists():
+                  continue
+              text = path.read_text(encoding="utf-8")
+              new_text = re.sub(
+                  r'(com\.android\.tools\.build:gradle:)[0-9A-Za-z.\-]+',
+                  r'\g<1>8.11.1',
+                  text,
+              )
+              if new_text != text:
+                  path.write_text(new_text, encoding="utf-8")
+                  changed.append(file_name)
+
+          # Compatibilidad con catálogos de versiones, si existieran.
+          toml = Path("android/gradle/libs.versions.toml")
+          if toml.exists():
+              text = toml.read_text(encoding="utf-8")
+              new_text = re.sub(
+                  r'(?m)^(agp\s*=\s*")[^"]+("\s*)$',
+                  r'\g<1>8.11.1\g<2>',
+                  text,
+              )
+              if new_text != text:
+                  toml.write_text(new_text, encoding="utf-8")
+                  changed.append(str(toml))
+
+          wrapper = Path("android/gradle/wrapper/gradle-wrapper.properties")
+          wrapper_text = wrapper.read_text(encoding="utf-8")
+          wrapper_text, count = re.subn(
+              r'distributionUrl=.*gradle-[0-9.]+-(?:all|bin)\.zip',
+              r'distributionUrl=https\\://services.gradle.org/distributions/gradle-8.13-all.zip',
+              wrapper_text,
+          )
+          if count == 0:
+              raise SystemExit("No se encontró distributionUrl de Gradle")
+          wrapper.write_text(wrapper_text, encoding="utf-8")
+
+          properties = Path("android/gradle.properties")
+          properties_text = properties.read_text(encoding="utf-8") if properties.exists() else ""
+          properties_text = re.sub(
+              r'(?m)^android\.(?:newDsl|builtInKotlin)=.*\n?',
+              '',
+              properties_text,
+          ).rstrip()
+          properties_text += "\n\nandroid.newDsl=false\nandroid.builtInKotlin=false\n"
+          properties.write_text(properties_text, encoding="utf-8")
+
+          print("Archivos Android ajustados:", changed)
+          PY
+
+          echo "===== settings.gradle ====="
+          grep -R "com.android.application" android/settings.gradle* || true
+          echo "===== gradle.properties ====="
+          grep -E '^android\.(newDsl|builtInKotlin)=' android/gradle.properties
+          echo "===== Gradle wrapper ====="
+          grep "distributionUrl" android/gradle/wrapper/gradle-wrapper.properties
+
+          if grep -R -E "com\.android\.application.*version.*[\"']9\." android/settings.gradle*; then
+            echo "ERROR: AGP 9 continúa activo. Se detiene antes de compilar."
+            exit 1
+          fi
+
+      - name: Aplicar nombre, logo y configuración Android
+        run: python3 tool/prepare_android.py
+
+      - name: Verificar Android TV, PiP, reproductor único y grabación
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -q "android.software.leanback" android/app/src/main/AndroidManifest.xml
+          grep -q "LEANBACK_LAUNCHER" android/app/src/main/AndroidManifest.xml
+          grep -q "supportsPictureInPicture" android/app/src/main/AndroidManifest.xml
+          grep -q "isTelevision" android/app/src/main/kotlin/mx/avotv/avo_tv/MainActivity.kt
+          grep -q "class PlayerActivity" android/app/src/main/kotlin/mx/avotv/avo_tv/MainActivity.kt
+          grep -q "replacePayload" android/app/src/main/kotlin/mx/avotv/avo_tv/MainActivity.kt
+          grep -q "hasActivePlayer" android/app/src/main/kotlin/mx/avotv/avo_tv/MainActivity.kt
+          grep -q "android.permission.FOREGROUND_SERVICE_DATA_SYNC" android/app/src/main/AndroidManifest.xml
+          grep -q 'android:name=".RecordingService"' android/app/src/main/AndroidManifest.xml
+          grep -q "class RecordingService" android/app/src/main/kotlin/mx/avotv/avo_tv/RecordingService.kt
+          grep -q "START_REDELIVER_INTENT" android/app/src/main/kotlin/mx/avotv/avo_tv/RecordingService.kt
+          grep -q "override fun onTimeout" android/app/src/main/kotlin/mx/avotv/avo_tv/RecordingService.kt
+          grep -q "RecordingBridge" android/app/src/main/kotlin/mx/avotv/avo_tv/RecordingService.kt
+          grep -q 'android:launchMode="singleTask"' android/app/src/main/AndroidManifest.xml
+          grep -q "bringToFront" android/app/src/main/kotlin/mx/avotv/avo_tv/MainActivity.kt
+          grep -q "FLAG_ACTIVITY_REORDER_TO_FRONT" android/app/src/main/kotlin/mx/avotv/avo_tv/MainActivity.kt
+          grep -q "LocalSegment" android/app/src/main/kotlin/mx/avotv/avo_tv/RecordingService.kt
+          grep -q "EXT-X-PLAYLIST-TYPE" android/app/src/main/kotlin/mx/avotv/avo_tv/RecordingService.kt
+          grep -q "repairStoredMedia" android/app/src/main/kotlin/mx/avotv/avo_tv/RecordingService.kt
+          grep -q "prepareForReplacement" lib/screens/video_player_screen.dart
+          grep -q "bringToFront: !fromChannelSelection" lib/screens/live_screen.dart
+
+      - name: Verificar detección automática de servidores
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -q "sammfloore.github.io/avotv-config" lib/core/provider_config.dart
+          grep -q "raw.githubusercontent.com/sammfloore" lib/core/provider_config.dart
+          grep -q "class ServerDirectoryService" lib/services/server_directory_service.dart
+          grep -q "avo_tv_server_directory_v1" lib/services/server_directory_service.dart
+          grep -q "ProviderConfig.fallbackServers" lib/services/server_directory_service.dart
+          grep -q "loadCandidates" lib/services/iptv_api_service.dart
+          grep -q "forProvider(endpoint)" lib/services/iptv_api_service.dart
+
+      - name: Verificar TV en vivo estable
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -q "evitamos abrir una conexión de vista previa" lib/screens/live_screen.dart
+          grep -q "_previewAutoStopTimer" lib/screens/live_screen.dart
+          grep -q "Timer? _liveHealthTimer" lib/screens/video_player_screen.dart
+          grep -q "_startLiveHealthMonitor" lib/screens/video_player_screen.dart
+          grep -q "final advanceProbe = widget.isLive ? value : display" lib/screens/video_player_screen.dart
+          grep -q "bufferSize: (widget.isLive ? 32 : 64)" lib/screens/video_player_screen.dart
+      - name: Instalar dependencias
+        run: flutter pub get
+
+      - name: Analizar código
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings
+
+      - name: Ejecutar pruebas
+        run: flutter test
+
+      - name: Construir APK
+        run: flutter build apk --release --no-tree-shake-icons
+
+      - name: Publicar APK descargable
+        uses: actions/upload-artifact@v7
+        with:
+          name: AVO-TV-Android-v0.7.1
+          path: build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
+          retention-days: 30
